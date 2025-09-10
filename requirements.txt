@@ -1,0 +1,5 @@
+ta-lib-binary>=0.4.28
+requests>=2.32.0
+pandas>=2.2.2
+python-dotenv>=1.0.1
+tzdata>=2024.1

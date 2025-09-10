@@ -1,0 +1,10 @@
+# venv
+.venv-v2/
+# python
+__pycache__/
+*.pyc
+# env
+.env
+# data/logs
+logs/
+data/
