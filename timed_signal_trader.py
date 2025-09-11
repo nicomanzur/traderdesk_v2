@@ -1,4 +1,6 @@
 # timed_signal_trader.py
+import json, os, time
+import requests
 from __future__ import annotations
 import os, time, json, smtplib, ssl
 from email.mime.text import MIMEText
@@ -6,10 +8,43 @@ from datetime import datetime, timezone, timedelta
 from typing import Dict, Optional
 from zoneinfo import ZoneInfo
 
-import requests
-
 from app.brokers.projectx_api import ProjectXClient
 from app.services.market_monitor import MarketMonitor
+
+SEEN_FILE = os.getenv("SEEN_SIGNALS_FILE", "seen_signals.json")
+
+def _load_seen() -> set[str]:
+    try:
+        with open(SEEN_FILE, "r", encoding="utf-8") as f:
+            return set(json.load(f))
+    except Exception:
+        return set()
+
+def _save_seen(seen: set[str]) -> None:
+    try:
+        with open(SEEN_FILE, "w", encoding="utf-8") as f:
+            json.dump(sorted(list(seen)), f, ensure_ascii=False)
+    except Exception as e:
+        print("[SEEN][WARN]", e)
+
+def _event_id(sym: str, as_of: str, signal: str) -> str:
+    # clave única por símbolo + vela + tipo de señal
+    return f"{sym}|{as_of}|{signal}"
+
+def _already_open_with_tag(px, account_id: int, contract_id: str, tag_prefix: str) -> bool:
+    """True si ya hay órdenes abiertas con un customTag que empieza con tag_prefix (para ese contrato)."""
+    try:
+        open_orders = px.search_open_orders(account_id)
+    except Exception as e:
+        print("[PRECHECK][WARN] open orders:", e)
+        return False
+    for o in open_orders:
+        if o.get("contractId") == contract_id:
+            tag = str(o.get("customTag", "") or "")
+            if tag.startswith(tag_prefix):
+                return True
+    return False
+
 
 # ===================== ENV / Parámetros =====================
 BAR_MINUTES = int(os.getenv("BAR_MINUTES", "15"))
