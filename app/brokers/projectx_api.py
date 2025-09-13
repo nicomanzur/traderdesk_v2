@@ -1,171 +1,305 @@
 # app/brokers/projectx_api.py
 from __future__ import annotations
-import os, datetime as dt
+
+import os
+import json
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
-import requests
 from urllib.parse import urlparse, urlunparse
-from dotenv import load_dotenv
 
-load_dotenv()
+import requests
 
-def _https_base(url: str) -> str:
-    u = urlparse(url.strip())
-    scheme = "https"
-    netloc = u.netloc or u.path
-    return urlunparse((scheme, netloc, "", "", "", ""))
+
+def _iso_z(dt: datetime) -> str:
+    return dt.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    v = os.getenv(name, "")
+    if v == "":
+        return default
+    return v.lower() in ("1", "true", "yes", "on")
+
 
 class ProjectXClient:
-    def __init__(self) -> None:
-        base = os.getenv("PROJECTX_API_BASE", "https://api.topstepx.com")
-        self.base_api = _https_base(base)
-        self.user = os.getenv("PROJECTX_USER", "").strip()
-        self.api_key = os.getenv("PROJECTX_API_KEY", "").strip()
+    """
+    Cliente ligero para TopstepX/ProjectX Gateway API.
+    Lee credenciales desde .env:
+      - PROJECTX_API_BASE (p.ej. https://api.topstepx.com)
+      - PROJECTX_USER
+      - PROJECTX_API_KEY
+    """
+
+    def __init__(self, base_api: Optional[str] = None, user: Optional[str] = None, api_key: Optional[str] = None):
+        # Base URL (forzar https)
+        base = base_api or os.getenv("PROJECTX_API_BASE", "https://api.topstepx.com").strip()
+        u = urlparse(base)
+        if u.scheme != "https":
+            base = urlunparse(("https", u.netloc, u.path, u.params, u.query, u.fragment))
+        self.base_api: str = base.rstrip("/")
+
+        # Credenciales
+        self.user: str = user or os.getenv("PROJECTX_USER", "").strip()
+        self.api_key: str = api_key or os.getenv("PROJECTX_API_KEY", "").strip()
+
+        # Sesión HTTP
         self.session = requests.Session()
-        self.token: Optional[str] = None
-        print(f"[ProjectXClient] base_api={self.base_api} user={self.user[:2]}***")
+        self._token: Optional[str] = None
+
+        # Debug HTTP
+        self.debug_http: bool = _env_bool("DEBUG_HTTP", False)
+
+        print(f"[ProjectXClient] base_api={self.base_api} user={self.user or '(env?)'}")
+
+    # ------------- HTTP helpers -------------
 
     def _headers(self) -> Dict[str, str]:
         h = {"Content-Type": "application/json"}
-        if self.token:
-            h["Authorization"] = f"Bearer {self.token}"
+        if self._token:
+            h["Authorization"] = f"Bearer {self._token}"
         return h
 
-    def _post(self, path: str, payload: Dict[str, Any], timeout: int = 30) -> Dict[str, Any]:
+    def _post(self, path: str, payload: Dict[str, Any], timeout: float = 30.0) -> Dict[str, Any]:
         url = f"{self.base_api}{path}"
-
-        def do():
-            return self.session.post(url, headers=self._headers(), json=payload, timeout=timeout)
-
-        r = do()
-        if r.status_code == 401:
-            # token ausente/vencido → re-login y reintento 1 vez
+        if self.debug_http:
             try:
-                self.login_with_key()
-                r = do()
+                print("POST", url)
+                print("payload:", json.dumps(payload, ensure_ascii=False))
             except Exception:
-                pass
-
-        try:
-            data = r.json()
-        except Exception:
-            data = {"raw": r.text}
-
+                print("POST", url)
+                print("payload:(no-dump)")
+        r = self.session.post(url, headers=self._headers(), json=payload, timeout=timeout)
         if not r.ok:
-            print("resp:", r.status_code, data)
+            # intentar mostrar body decodificado
+            try:
+                body = r.json()
+            except Exception:
+                body = {"raw": r.text[:500]}
+            print("resp:", r.status_code, body)
             r.raise_for_status()
-        return data
+        try:
+            return r.json()
+        except Exception:
+            return {"raw": r.text}
 
-    # -------- Auth --------
+    # ------------- Auth -------------
+
     def login_with_key(self) -> str:
+        """
+        POST /api/Auth/loginKey   (prod)
+        payload: { "userName": <str>, "apiKey": <str> }
+        """
+        if not self.user or not self.api_key:
+            raise requests.HTTPError("Missing PROJECTX_USER / PROJECTX_API_KEY", response=requests.Response())
+
         payload = {"userName": self.user, "apiKey": self.api_key}
-        # endpoint correcto: /api/Auth/loginKey
-        data = self._post("/api/Auth/loginKey", payload, timeout=20)
-        if not data.get("success"):
-            raise RuntimeError(f"Auth failed: {data}")
-        token = data.get("token")
+
+        # preferido: loginKey
+        try:
+            data = self._post("/api/Auth/loginKey", payload, timeout=20)
+        except requests.HTTPError as e:
+            # compatibilidad con ambientes viejos que usaban loginWithKey
+            if e.response is not None and e.response.status_code == 404:
+                data = self._post("/api/Auth/loginWithKey", payload, timeout=20)
+            else:
+                raise
+
+        token = (data or {}).get("token")
         if not token:
-            raise RuntimeError(f"No token in response: {data}")
-        self.token = token
+            raise requests.HTTPError("Auth failed", response=requests.Response())
+
+        self._token = token
+        self.session.headers.update({"Authorization": f"Bearer {self._token}"})
         return token
 
+
     def validate_token(self) -> bool:
+        """
+        POST /api/Auth/validate
+        """
         data = self._post("/api/Auth/validate", {}, timeout=10)
-        return bool(data.get("success"))
+        return bool((data or {}).get("success", False))
 
-    # -------- Accounts --------
+    # ------------- Accounts -------------
+
     def search_accounts(self, only_active: bool = True) -> List[Dict[str, Any]]:
-        data = self._post("/api/Account/search", {"onlyActiveAccounts": only_active}, timeout=20)
-        if not data.get("success"):
+        """
+        POST /api/Account/search
+        payload: { "onlyActiveAccounts": true/false }
+        """
+        payload = {"onlyActiveAccounts": bool(only_active)}
+        data = self._post("/api/Account/search", payload, timeout=15)
+        if not data.get("success", False):
             raise RuntimeError(f"Account.search failed: {data}")
-        return data.get("accounts", []) or data.get("items", [])
+        return data.get("accounts", []) or []
 
-    # -------- Contracts --------
+    # ------------- Contracts -------------
+
     def search_contracts(self, text: str, live: bool = False) -> List[Dict[str, Any]]:
-        payload = {"searchText": text, "liveSubscription": live}
+        """
+        POST /api/Contract/search
+        payload: { "text": <str>, "live": <bool> }
+        """
+        payload = {"text": text, "live": bool(live)}
         data = self._post("/api/Contract/search", payload, timeout=20)
-        if not data.get("success"):
+        if not data.get("success", False):
             raise RuntimeError(f"Contract.search failed: {data}")
-        return data.get("contracts", []) or data.get("items", [])
+        return data.get("contracts", []) or []
 
     def search_contracts_by_id(self, contract_id: str) -> List[Dict[str, Any]]:
-        data = self._post("/api/Contract/searchById", {"contractId": contract_id}, timeout=15)
-        if not data.get("success"):
+        """
+        POST /api/Contract/searchById
+        payload: { "contractId": <str> }
+        """
+        payload = {"contractId": contract_id}
+        data = self._post("/api/Contract/searchById", payload, timeout=15)
+        if not data.get("success", False):
             raise RuntimeError(f"Contract.searchById failed: {data}")
-        return data.get("contracts", []) or data.get("items", [])
+        return data.get("contracts", []) or []
 
-    # -------- History (bars) --------
+    # ------------- History / Bars -------------
+
     def retrieve_bars(
         self,
         contract_id: str,
-        live: bool = False,
-        unit: int = 2,
-        unit_number: int = 15,
+        live: bool,
+        unit: int,
+        unit_number: int,
         include_partial: bool = False,
         limit: int = 400,
         lookback_days: Optional[int] = None,
-        start: Optional[dt.datetime] = None,
-        end: Optional[dt.datetime] = None,
+        start_time: Optional[datetime] = None,
+        end_time: Optional[datetime] = None,
     ) -> List[Dict[str, Any]]:
-        now = dt.datetime.now(dt.timezone.utc)
-        if end is None:
-            end = now
-        if start is None:
-            days = lookback_days or 7
-            start = end - dt.timedelta(days=days)
+        """
+        POST /api/History/retrieveBars
+        payload (sin wrapper "request"):
+          {
+            "contractId": "CON.F.US.MNQ.U25",
+            "live": false,
+            "unit": 2,                    # 2=Minute
+            "unitNumber": 15,             # 15-minute bars
+            "startTime": "...Z",
+            "endTime":   "...Z",
+            "limit": 400,
+            "includePartialBar": false
+          }
+        - Si no se pasan start_time/end_time, se calculan por lookback_days (por defecto 7-14d).
+        """
+        if end_time is None:
+            end_time = datetime.now(timezone.utc)
+        if start_time is None:
+            days = lookback_days if (lookback_days and lookback_days > 0) else 7
+            start_time = end_time - timedelta(days=days)
+
         payload = {
             "contractId": contract_id,
             "live": bool(live),
-            "unit": unit,
-            "unitNumber": unit_number,
-            "startTime": start.replace(microsecond=0).isoformat().replace("+00:00","Z"),
-            "endTime":   end.replace(microsecond=0).isoformat().replace("+00:00","Z"),
+            "unit": int(unit),
+            "unitNumber": int(unit_number),
+            "startTime": _iso_z(start_time),
+            "endTime": _iso_z(end_time),
             "limit": int(limit),
             "includePartialBar": bool(include_partial),
         }
         data = self._post("/api/History/retrieveBars", payload, timeout=30)
-        if not data.get("success"):
+        # formato esperado: { success: bool, bars: [...] }
+        if not data.get("success", False):
             raise RuntimeError(f"retrieveBars failed: {data}")
-        return data.get("bars") or []
+        bars = data.get("bars") or []
+        return bars
 
-    # -------- Orders --------
-    def place_order(
-        self,
-        account_id: int,
-        contract_id: str,
-        side: int,                 # 0=Buy, 1=Sell
-        size: int,
-        order_type: int = 2,       # 2=Market, 1=Limit, 4=Stop
-        limit_price: Optional[float] = None,
-        stop_price: Optional[float] = None,
-        linked_order_id: Optional[int] = None,
-        customTag: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        payload: Dict[str, Any] = {
-            "accountId": account_id,
-            "contractId": contract_id,
-            "type": order_type,
-            "side": side,
-            "size": size,
+    # ------------- Orders / Trades -------------
+
+    def place_order(self, **kwargs) -> Dict[str, Any]:
+        """
+        POST /api/Order/place
+        Acepta kwargs en snake_case y los mapea a camelCase. Soporta campos:
+          - account_id / accountId (int)
+          - contract_id / contractId (str)
+          - type / order_type (int)    # 1=Limit, 2=Market, 4=Stop, 5=Trailing...
+          - side (int)                 # 0=Buy, 1=Sell
+          - size (int)
+          - limit_price / limitPrice (float)
+          - stop_price  / stopPrice  (float)
+          - trail_price / trailPrice (float)
+          - custom_tag  / customTag  (str)
+          - linked_order_id / linkedOrderId (int)
+        """
+        # normalizar nombres
+        mapping = {
+            "account_id": "accountId",
+            "contract_id": "contractId",
+            "order_type": "type",
+            "type": "type",
+            "side": "side",
+            "size": "size",
+            "limit_price": "limitPrice",
+            "stop_price": "stopPrice",
+            "trail_price": "trailPrice",
+            "custom_tag": "customTag",
+            "linked_order_id": "linkedOrderId",
         }
-        if limit_price is not None:
-            payload["limitPrice"] = float(limit_price)
-        if stop_price is not None:
-            payload["stopPrice"] = float(stop_price)
-        if linked_order_id is not None:
-            payload["linkedOrderId"] = linked_order_id
-        if customTag:
-            payload["customTag"] = customTag
+        payload: Dict[str, Any] = {}
+        for k, v in kwargs.items():
+            kk = mapping.get(k, k)
+            payload[kk] = v
 
-        data = self._post("/api/Order/place", payload, timeout=20)
-        if not data.get("success"):
+        # sanity required
+        req = ["accountId", "contractId", "type", "side", "size"]
+        for k in req:
+            if k not in payload:
+                raise ValueError(f"place_order missing field: {k}")
+
+        data = self._post("/api/Order/place", payload, timeout=15)
+        if not data.get("success", False):
             raise RuntimeError(f"order.place failed: {data}")
         return data
 
+    def cancel_order(self, account_id: int, order_id: int) -> Dict[str, Any]:
+        """
+        POST /api/Order/cancel
+        payload: { "accountId": <int>, "orderId": <int> }
+        """
+        payload = {"accountId": int(account_id), "orderId": int(order_id)}
+        data = self._post("/api/Order/cancel", payload, timeout=10)
+        if not data.get("success", False):
+            raise RuntimeError(f"order.cancel failed: {data}")
+        return data
+
+    def search_open_orders(self, account_id: int) -> List[Dict[str, Any]]:
+        """
+        POST /api/Order/searchOpen
+        payload: { "accountId": <int> }
+        """
+        payload = {"accountId": int(account_id)}
+        data = self._post("/api/Order/searchOpen", payload, timeout=15)
+        if not data.get("success", False):
+            raise RuntimeError(f"order.searchOpen failed: {data}")
+        return data.get("orders", []) or []
+
+    def search_orders(self, account_id: int, start_iso: str, end_iso: Optional[str] = None) -> List[Dict[str, Any]]:
+        """
+        POST /api/Order/search
+        payload: { "accountId": <int>, "startTimestamp": <iso>, ["endTimestamp": <iso>] }
+        """
+        payload = {"accountId": int(account_id), "startTimestamp": start_iso}
+        if end_iso:
+            payload["endTimestamp"] = end_iso
+        data = self._post("/api/Order/search", payload, timeout=20)
+        if not data.get("success", False):
+            raise RuntimeError(f"order.search failed: {data}")
+        return data.get("orders", []) or []
+
     def search_trades(self, account_id: int, start_iso: str, end_iso: Optional[str] = None) -> List[Dict[str, Any]]:
-        payload: Dict[str, Any] = {"accountId": account_id, "startTimestamp": start_iso}
+        """
+        POST /api/Trade/search
+        payload: { "accountId": <int>, "startTimestamp": <iso>, ["endTimestamp": <iso>] }
+        """
+        payload = {"accountId": int(account_id), "startTimestamp": start_iso}
         if end_iso:
             payload["endTimestamp"] = end_iso
         data = self._post("/api/Trade/search", payload, timeout=20)
-        if not data.get("success"):
-            raise RuntimeError(f"Trade.search failed: {data}")
+        if not data.get("success", False):
+            raise RuntimeError(f"trade.search failed: {data}")
         return data.get("trades", []) or []

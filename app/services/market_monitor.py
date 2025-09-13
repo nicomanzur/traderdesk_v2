@@ -110,7 +110,6 @@ except Exception:
 
 def _color_from_zone(prev_close: float, prev_e50: float, prev_e200: float,
                      curr_close: float, curr_e50: float, curr_e200: float) -> str:
-    # Verde si la vela previa cerró dentro (entre e50/e200). Amarillo si no estaba y ahora está dentro. Rojo si no.
     low_prev, high_prev = (min(prev_e50, prev_e200), max(prev_e50, prev_e200))
     low_curr, high_curr = (min(curr_e50, curr_e200), max(curr_e50, curr_e200))
     prev_in = (low_prev <= prev_close <= high_prev)
@@ -132,13 +131,10 @@ def _signal_cross50_with_bias(prev_close: float, prev_e50: float,
       Señal SHORT si prev_close > EMA50 (prev) y curr_close < EMA50 (curr).
     Tolerancia EPS opcional en el cruce.
     """
-    # Bias por EMAs actuales (BASE)
     if (curr_e50 - curr_e200_base) > EPS:
-        # LONG bias
         if (prev_close < (prev_e50 - EPS)) and (curr_close > (curr_e50 + EPS)):
             return "LONG"
     elif (curr_e200_base - curr_e50) > EPS:
-        # SHORT bias
         if (prev_close > (prev_e50 + EPS)) and (curr_close < (curr_e50 - EPS)):
             return "SHORT"
     return None
@@ -162,65 +158,49 @@ class MarketMonitor:
         if not getattr(self.px, "_token", None):
             self.px.login_with_key()
 
-        # Resolver contractId
         self.contract_id: Optional[str] = self._resolve_contract_id(self.sym_raw)
 
-        # Estado incremental
         self.state = {
             "seeded": False,
-            "bars": 0,                 # barras en el dataset que respalda las EMAs
-            # prev bar (base):
+            "bars": 0,
             "prev_ts": None,
             "prev_close": None,
             "prev_e50": None,
-            "prev_e200_base": None,    # base
-            "prev_e200": None,         # mostrado (suavizado o base)
-            # curr bar (última cerrada conocida, base):
+            "prev_e200_base": None,
+            "prev_e200": None,
             "curr_ts": None,
             "curr_close": None,
             "curr_e50": None,
-            "curr_e200_base": None,    # base
-            "curr_e200": None,         # mostrado (suavizado o base)
-            # buffer para suavizado EMA200 (valores base recientes)
-            "ema200_buf": [],          # list[float], máx EMA200_SMOOTH_LENGTH
+            "curr_e200_base": None,
+            "curr_e200": None,
+            "ema200_buf": [],
         }
 
-        # Coeficientes de EMA base
         self.alpha50  = 2.0 / (50.0 + 1.0)
         self.alpha200 = 2.0 / (200.0 + 1.0)
 
-    # -------- Resolver contrato ----------
     def _resolve_contract_id(self, sym: str) -> Optional[str]:
-        # Si ya viene como contractId
         if sym.startswith("CON."):
             return sym
-
-        # Mapear por ENV directo si es MNQ o ES
         if sym in ("MNQ", "NQ") and ENV_CONTRACT_MNQ:
             return ENV_CONTRACT_MNQ
         if sym in ("ES", "SP", "SP500") and ENV_CONTRACT_ES:
             return ENV_CONTRACT_ES
-
-        # Buscar por texto si no hay env (probamos sinónimos)
         texts = SYNONYMS.get(sym, [sym])
         live_flag = True if FORCE_LIVE else False
-
         for t in texts:
             try:
                 contracts = self.px.search_contracts(t, live=live_flag)
                 if not contracts:
                     continue
-                # activo (front) si hay
                 active = [c for c in contracts if c.get("activeContract")] or contracts
                 cand = active[0]
                 if cand and cand.get("id"):
                     return cand["id"]
             except Exception:
                 continue
-
         return None
 
-    # -------- Seed: histórico suficiente ----------
     def _seed_from_history(self, contract_id: str) -> Tuple[bool, str]:
         lookback_days = int(os.getenv("BARS_LOOKBACK_DAYS", str(DEFAULT_LOOKBACK_DAYS)) or DEFAULT_LOOKBACK_DAYS)
         limit = max(WARMUP_BARS, REQUIRED_BARS + 200)
@@ -237,7 +217,6 @@ class MarketMonitor:
         )
         df = _bars_to_df(bars)
 
-        # Filtrar RTH si corresponde
         if CHART_SESSION == "RTH" and not df.empty:
             local = df["datetime"].dt.tz_convert(NY)
             hm = local.dt.strftime("%H:%M")
@@ -248,11 +227,9 @@ class MarketMonitor:
         if n < REQUIRED_BARS:
             return False, f"Datos insuficientes {n}/{REQUIRED_BARS} velas {BAR_MINUTES}m"
 
-        # Calcular EMAs base
         df["ema50"]        = ema_ind(df["close"], 50)
         df["ema200_base"]  = ema_ind(df["close"], 200)
 
-        # EMA200 mostrada (suavizada opcionalmente)
         if EMA200_SMOOTH_TYPE == "sma" and EMA200_SMOOTH_LENGTH > 1:
             df["ema200"] = df["ema200_base"].rolling(EMA200_SMOOTH_LENGTH).mean()
         else:
@@ -261,7 +238,6 @@ class MarketMonitor:
         if pd.isna(df["ema200"].iloc[-1]) or pd.isna(df["ema50"].iloc[-1]):
             return False, "EMAs aún NaN tras semilla (aumentar lookback)"
 
-        # fijar prev/curr y buffer de suavizado
         prev, curr = df.iloc[-2], df.iloc[-1]
         buf_len = max(1, EMA200_SMOOTH_LENGTH if (EMA200_SMOOTH_TYPE == "sma") else 1)
         ema200_buf = df["ema200_base"].tail(buf_len).tolist()
@@ -283,19 +259,14 @@ class MarketMonitor:
         })
         return True, "ok"
 
-    # -------- Recalcular tail en cierre (match exacto) ----------
     def _recalc_tail(self, contract_id: str, tail_bars: int = 1200) -> Tuple[bool, str]:
-        """
-        Recalcula EMA50/EMA200 desde ~tail_bars velas cerradas recientes.
-        Se usa en el cierre de cada vela para “pixel match” con la plataforma.
-        """
         live_flag = True if FORCE_LIVE else False
         bars = self.px.retrieve_bars(
             contract_id=contract_id,
             live=live_flag,
             unit=2,
             unit_number=BAR_MINUTES,
-            include_partial=False,       # solo cerradas
+            include_partial=False,
             limit=tail_bars,
             lookback_days=max(DEFAULT_LOOKBACK_DAYS, 30),
         )
@@ -341,7 +312,6 @@ class MarketMonitor:
         })
         return True, "ok"
 
-    # -------- Obtener última vela cerrada ----------
     def _get_last_closed_bar(self, contract_id: str) -> Optional[Tuple[pd.Timestamp, float]]:
         live_flag = True if FORCE_LIVE else False
         bars = self.px.retrieve_bars(
@@ -349,7 +319,7 @@ class MarketMonitor:
             live=live_flag,
             unit=2,
             unit_number=BAR_MINUTES,
-            include_partial=False,   # SOLO cerradas
+            include_partial=False,
             limit=2,
             lookback_days=2,
         )
@@ -362,18 +332,15 @@ class MarketMonitor:
             return None
         return ts, float(last["close"])
 
-    # -------- Avanzar EMA incremental ----------
     def _advance_incremental(self, ts: pd.Timestamp, close: float) -> None:
         st = self.state
         if st["curr_ts"] is None or ts > st["curr_ts"]:
-            # mover curr -> prev (valores BASE y mostrados)
             st["prev_ts"]         = st["curr_ts"]
             st["prev_close"]      = st["curr_close"]
             st["prev_e50"]        = st["curr_e50"]
             st["prev_e200_base"]  = st["curr_e200_base"]
             st["prev_e200"]       = st["curr_e200"]
 
-            # calcular nueva EMA base
             prev_e50  = st["prev_e50"]
             prev_e200_base = st["prev_e200_base"]
             if prev_e50 is None or prev_e200_base is None:
@@ -382,7 +349,6 @@ class MarketMonitor:
             new_e50_base  = prev_e50  + self.alpha50  * (close - prev_e50)
             new_e200_base = prev_e200_base + self.alpha200 * (close - prev_e200_base)
 
-            # suavizado opcional para mostrar EMA200
             if EMA200_SMOOTH_TYPE == "sma" and EMA200_SMOOTH_LENGTH > 1:
                 buf = st.get("ema200_buf", [])
                 buf.append(float(new_e200_base))
@@ -393,7 +359,6 @@ class MarketMonitor:
             else:
                 new_e200_shown = float(new_e200_base)
 
-            # set curr
             st["curr_ts"]        = ts
             st["curr_close"]     = close
             st["curr_e50"]       = float(new_e50_base)
@@ -401,37 +366,27 @@ class MarketMonitor:
             st["curr_e200"]      = float(new_e200_shown)
             st["bars"]           = int(st.get("bars", 0)) + 1
 
-    # -------- API pública ----------
     def get_snapshot(self) -> Tuple[Optional[Snapshot], str]:
-        """
-        Devuelve (Snapshot|None, mensaje).
-        - None si no hay contrato o no se pudo semillar.
-        - Si no hay bar nueva, devuelve el último snapshot conocido (curr).
-        """
         if not self.contract_id:
             return None, "Sin contractId (revisá .env o permisos de datos)"
 
-        # Seed si falta
         if not self.state["seeded"]:
             ok, msg = self._seed_from_history(self.contract_id)
             if not ok:
                 return None, msg
 
-        # Buscar última vela cerrada
         last = self._get_last_closed_bar(self.contract_id)
         if last is not None:
             ts, close = last
             st = self.state
             if st["curr_ts"] is not None:
                 gap_s = (ts - st["curr_ts"]).total_seconds()
-                if gap_s > 20 * 60:  # gap grande: re-seed
+                if gap_s > 20 * 60:
                     ok, msg = self._seed_from_history(self.contract_id)
                     if not ok:
                         return None, msg
                 elif ts > st["curr_ts"]:
-                    # Avance rápido
                     self._advance_incremental(ts, close)
-                    # En el cierre, recalcular tail para match exacto (opcional)
                     if EXACT_MATCH_ON_CLOSE:
                         ok2, msg2 = self._recalc_tail(self.contract_id, tail_bars=1200)
                         if not ok2:
@@ -445,14 +400,12 @@ class MarketMonitor:
         if st["curr_ts"] is None or st["curr_e50"] is None or st["curr_e200"] is None:
             return None, "Aún sin snapshot actual"
 
-        # Color (visual; no afecta señal)
         color  = "gray"
         if None not in (st["prev_close"], st["prev_e50"], st["prev_e200_base"],
                         st["curr_close"], st["curr_e50"], st["curr_e200_base"]):
             color  = _color_from_zone(st["prev_close"], st["prev_e50"], st["prev_e200_base"],
                                       st["curr_close"], st["curr_e50"], st["curr_e200_base"])
 
-        # Señal con tu regla (bias por EMA50 vs EMA200 base; cruce cierre vs EMA50)
         signal = None
         if None not in (st["prev_close"], st["prev_e50"], st["curr_close"], st["curr_e50"], st["curr_e200_base"]):
             signal = _signal_cross50_with_bias(
@@ -468,8 +421,8 @@ class MarketMonitor:
             contract_id=self.contract_id,
             as_of=st["curr_ts"].replace(tzinfo=timezone.utc).isoformat().replace("+00:00", "Z"),
             close=float(st["curr_close"]),
-            ema50=float(st["curr_e50"]),        # base (no suavizada)
-            ema200=float(st["curr_e200"]),      # mostrada (suavizada si aplica)
+            ema50=float(st["curr_e50"]),
+            ema200=float(st["curr_e200"]),
             color=color if color in ("green", "yellow", "red") else "gray",
             signal=signal,
             bars=int(st["bars"]),
@@ -477,9 +430,7 @@ class MarketMonitor:
         )
         return snap, "ok"
 
-    # -------- Diagnóstico extendido ----------
     def get_debug_state(self) -> dict:
-        """Devuelve todos los valores que intervienen en la señal y por qué no disparó."""
         st = self.state
         out = {
             "seeded": st.get("seeded", False),
@@ -497,27 +448,26 @@ class MarketMonitor:
             "conds": {}
         }
         try:
-            # Color / bias / cruces
             if None not in (st["prev_close"], st["prev_e50"], st["prev_e200_base"],
                             st["curr_close"], st["curr_e50"], st["curr_e200_base"]):
                 prev_close = st["prev_close"]; curr_close = st["curr_close"]
                 prev_e50 = st["prev_e50"]; prev_e200 = st["prev_e200_base"]
                 curr_e50 = st["curr_e50"]; curr_e200 = st["curr_e200_base"]
 
-                # color
                 low_prev, high_prev = (min(prev_e50, prev_e200), max(prev_e50, prev_e200))
                 low_curr, high_curr = (min(curr_e50, curr_e200), max(curr_e50, curr_e200))
                 prev_in = (low_prev <= prev_close <= high_prev)
                 curr_in = (low_curr <= curr_close <= high_curr)
                 out["color"] = "green" if prev_in else ("yellow" if (not prev_in and curr_in) else "red")
 
-                # bias / cruces
                 bias = "FLAT"
-                if curr_e50 > curr_e200 + EPS: bias = "LONG"
-                elif curr_e200 > curr_e50 + EPS: bias = "SHORT"
+                if curr_e50 > curr_e200:
+                    bias = "LONG"
+                elif curr_e200 > curr_e50:
+                    bias = "SHORT"
 
-                cross_up   = (prev_close < (prev_e50 - EPS)) and (curr_close > (curr_e50 + EPS))
-                cross_down = (prev_close > (prev_e50 + EPS)) and (curr_close < (curr_e50 - EPS))
+                cross_up   = (prev_close < prev_e50) and (curr_close > curr_e50)
+                cross_down = (prev_close > prev_e50) and (curr_close < curr_e50)
 
                 sig = None
                 if bias == "LONG" and cross_up: sig = "LONG"
